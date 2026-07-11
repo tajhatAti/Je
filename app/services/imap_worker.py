@@ -1,10 +1,11 @@
-"""Per-account IMAP IDLE worker.
+"""Per-account IMAP polling worker.
 
 Runs an infinite loop that:
 1. Opens an aioimaplib connection and logs in.
-2. Selects INBOX and issues IDLE.
-3. Emits an event whenever the server pushes EXISTS.
-4. Recovers from any failure with exponential backoff.
+2. Selects INBOX.
+3. Every POLL_INTERVAL seconds, checks for the newest message.
+4. Emits an event when the newest message UID changes.
+5. Recovers from any failure with exponential backoff.
 """
 from __future__ import annotations
 
@@ -20,7 +21,7 @@ from ..config import ImapAccount
 
 log = logging.getLogger("email-monitor.imap")
 
-IDLE_TIMEOUT = 25 * 60
+POLL_INTERVAL = 15  # seconds between checks
 
 
 async def _fetch_latest(client: aioimaplib.IMAP4_SSL, account_email: str) -> dict | None:
@@ -57,6 +58,7 @@ async def _fetch_latest(client: aioimaplib.IMAP4_SSL, account_email: str) -> dic
         "senderEmail": from_addr or None,
         "subject": msg.get("Subject", "(no subject)"),
         "timestamp": ts_iso,
+        "_uid": latest_uid,
     }
 
 
@@ -69,6 +71,7 @@ async def run_worker(
 
     while not stop_event.is_set():
         client: aioimaplib.IMAP4_SSL | None = None
+        last_uid: str | None = None
         try:
             client = aioimaplib.IMAP4_SSL(host=account.host, port=account.port, timeout=30)
             await client.wait_hello_from_server()
@@ -77,48 +80,26 @@ async def run_worker(
             log.info("[%s] connected", account.email)
             backoff = 2.0
 
+            # Emit the latest existing message once so the UI has context.
             latest = await _fetch_latest(client, account.email)
             if latest:
+                last_uid = latest["_uid"]
                 await on_event(latest)
 
             while not stop_event.is_set():
-                idle_task = await client.idle_start(timeout=IDLE_TIMEOUT)
-                log.info("[%s] idling", account.email)
-
-                got_push = False
-                while client.has_pending_idle():
-                    push_task = asyncio.ensure_future(client.wait_server_push())
-                    stop_wait = asyncio.ensure_future(stop_event.wait())
-                    done, pending = await asyncio.wait(
-                        {push_task, stop_wait},
-                        return_when=asyncio.FIRST_COMPLETED,
-                    )
-                    for p in pending:
-                        p.cancel()
-
-                    if stop_event.is_set():
-                        client.idle_done()
-                        break
-
-                    msg = push_task.result()
-                    log.info("[%s] server push: %s", account.email, msg)
-                    if msg != aioimaplib.STOP_WAIT_SERVER_PUSH:
-                        got_push = True
-                    client.idle_done()
-                    break
-
                 try:
-                    await asyncio.wait_for(idle_task, timeout=10)
+                    await asyncio.wait_for(stop_event.wait(), timeout=POLL_INTERVAL)
                 except asyncio.TimeoutError:
                     pass
 
                 if stop_event.is_set():
                     break
 
-                if got_push:
-                    latest = await _fetch_latest(client, account.email)
-                    if latest:
-                        await on_event(latest)
+                latest = await _fetch_latest(client, account.email)
+                if latest and latest["_uid"] != last_uid:
+                    log.info("[%s] new mail detected: %s", account.email, latest["subject"])
+                    last_uid = latest["_uid"]
+                    await on_event(latest)
 
         except asyncio.CancelledError:
             raise
