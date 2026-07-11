@@ -83,25 +83,42 @@ async def run_worker(
 
             while not stop_event.is_set():
                 idle_task = await client.idle_start(timeout=IDLE_TIMEOUT)
+                log.info("[%s] idling", account.email)
 
-                stop_wait = asyncio.create_task(stop_event.wait())
-                done, _ = await asyncio.wait(
-                    {idle_task, stop_wait},
-                    return_when=asyncio.FIRST_COMPLETED,
-                )
-                client.idle_done()
+                got_push = False
+                while client.has_pending_idle():
+                    push_task = asyncio.ensure_future(client.wait_server_push())
+                    stop_wait = asyncio.ensure_future(stop_event.wait())
+                    done, pending = await asyncio.wait(
+                        {push_task, stop_wait},
+                        return_when=asyncio.FIRST_COMPLETED,
+                    )
+                    for p in pending:
+                        p.cancel()
+
+                    if stop_event.is_set():
+                        client.idle_done()
+                        break
+
+                    msg = push_task.result()
+                    log.info("[%s] server push: %s", account.email, msg)
+                    if msg != aioimaplib.STOP_WAIT_SERVER_PUSH:
+                        got_push = True
+                    client.idle_done()
+                    break
+
                 try:
-                    await asyncio.wait_for(idle_task, timeout=5)
+                    await asyncio.wait_for(idle_task, timeout=10)
                 except asyncio.TimeoutError:
                     pass
-                stop_wait.cancel()
 
                 if stop_event.is_set():
                     break
 
-                latest = await _fetch_latest(client, account.email)
-                if latest:
-                    await on_event(latest)
+                if got_push:
+                    latest = await _fetch_latest(client, account.email)
+                    if latest:
+                        await on_event(latest)
 
         except asyncio.CancelledError:
             raise
