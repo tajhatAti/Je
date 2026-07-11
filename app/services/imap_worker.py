@@ -25,7 +25,7 @@ IDLE_TIMEOUT = 25 * 60
 
 async def _fetch_latest(client: aioimaplib.IMAP4_SSL, account_email: str) -> dict | None:
     """Fetch metadata for the newest message in the mailbox."""
-    typ, data = await client.uid("search", "ALL")
+    typ, data = await client.search("ALL", by_uid=True)
     if typ != "OK" or not data or not data[0]:
         return None
 
@@ -34,7 +34,7 @@ async def _fetch_latest(client: aioimaplib.IMAP4_SSL, account_email: str) -> dic
         return None
 
     latest_uid = uids[-1].decode()
-    typ, msg_data = await client.uid("fetch", latest_uid, "(BODY.PEEK[HEADER])")
+    typ, msg_data = await client.fetch(latest_uid, "(BODY.PEEK[HEADER])", by_uid=True)
     if typ != "OK":
         return None
 
